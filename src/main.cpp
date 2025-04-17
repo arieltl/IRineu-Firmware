@@ -1,0 +1,182 @@
+// IR Receiver Example - Cleaned Version
+// Receives and decodes IR signals using IRremoteESP8266 library
+
+#include <Arduino.h>
+#include <IRac.h>
+#include <IRrecv.h>
+#include <IRremoteESP8266.h>
+#include <IRtext.h>
+#include <IRutils.h>
+#include <assert.h>
+#include <ESP8266WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+
+// WiFi and MQTT configuration
+const char *ssid = "ssid";
+const char *password = "pass";
+const char *mqtt_server = "192.168.15.71";
+const char *mqtt_topic_receive = "ac/state";
+const char *mqtt_topic_send = "ac/command";
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+const uint16_t kRecvPin = 5; // Use GPIO 5 (D1 on NodeMCU)
+#define kSendPin  4 // Use GPIO 4 (D2 on NodeMCU)
+const uint32_t kBaudRate = 115200; // Serial baud rate
+const uint16_t kCaptureBufferSize = 1024; // Buffer for IR data
+#if DECODE_AC
+const uint8_t kTimeout = 50; // Timeout for A/C remotes
+#else
+const uint8_t kTimeout = 15; // Timeout for most remotes
+#endif
+const uint16_t kMinUnknownSize = 12; // Minimum size for unknown messages
+const uint8_t kTolerancePercentage = kTolerance; // Signal tolerance
+#define LEGACY_TIMING_INFO false
+// === END CONFIGURATION ===
+
+#define REBOOT_BUTTON_PIN 0
+
+IRrecv irrecv(kRecvPin, kCaptureBufferSize, kTimeout, true);
+decode_results results;
+
+void connectToWiFi() {
+    Serial.print("Connecting to WiFi");
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println("Connected to WiFi");
+}
+
+void connectToMQTT() {
+    while (!client.connected()) {
+        Serial.print("Connecting to MQTT...");
+        if (client.connect("ESP8266Client")) {
+            Serial.println("connected");
+            client.subscribe(mqtt_topic_receive);
+        } else {
+            Serial.print("failed with state ");
+            Serial.println(client.state());
+            delay(2000);
+        }
+    }
+}
+
+void callback(char *topic, byte *payload, unsigned int length) {
+    String message;
+    for (int i = 0; i < length; i++) {
+        message += (char)payload[i];
+    }
+    Serial.print("Message received: ");
+    Serial.println(message);
+
+    if (String(topic) == mqtt_topic_receive) {
+        StaticJsonDocument<256> doc;
+        DeserializationError error = deserializeJson(doc, message);
+
+        if (error) {
+            Serial.print("Failed to parse JSON: ");
+            Serial.println(error.c_str());
+            return;
+        }
+
+        // Extract AC state from JSON
+        bool power = doc["power"] | false;
+        int temperature = doc["temperature"] | 24;
+        const char* mode = doc["mode"] | "cool";
+        const char* fan = doc["fan"] | "auto";
+        const char* protocol = doc["protocol"] | "GREE";
+        int model = doc["model"] | 0;
+
+        // Configure IR command
+        IRac ac(kSendPin);
+        ac.next.protocol = strToDecodeType(protocol);
+        ac.next.model = model;
+        ac.next.power = power;
+        ac.next.degrees = temperature;
+        ac.next.mode = IRac::strToOpmode(mode, stdAc::opmode_t::kAuto);
+        ac.next.fanspeed = IRac::strToFanspeed(fan, stdAc::fanspeed_t::kAuto);
+
+        // Send IR command
+        ac.sendAc();
+        Serial.println("IR command sent.");
+    }
+}
+
+void checkRebootButton() {
+    pinMode(REBOOT_BUTTON_PIN, INPUT_PULLUP);
+    if (digitalRead(REBOOT_BUTTON_PIN) == LOW) {
+        Serial.println("Reboot button pressed. Rebooting...");
+        ESP.restart();
+    }
+}
+
+void setup()
+{
+    Serial.begin(kBaudRate, SERIAL_8N1, SERIAL_TX_ONLY);
+    while (!Serial)
+        delay(50); // Wait for serial connection
+    assert(irutils::lowLevelSanityCheck() == 0);
+
+    Serial.printf("\n" D_STR_IRRECVDUMP_STARTUP "\n", kRecvPin);
+#if DECODE_HASH
+    irrecv.setUnknownThreshold(kMinUnknownSize);
+#endif
+    irrecv.setTolerance(kTolerancePercentage);
+    irrecv.enableIRIn();
+
+    connectToWiFi();
+    client.setServer(mqtt_server, 1883);
+    client.setCallback(callback);
+}
+
+void loop()
+{
+    if (!client.connected()) {
+        connectToMQTT();
+    }
+    client.loop();
+
+    checkRebootButton();
+
+    if (irrecv.decode(&results)) {
+        uint32_t now = millis();
+        Serial.printf(D_STR_TIMESTAMP " : %06u.%03u\n", now / 1000, now % 1000);
+        if (results.overflow)
+            Serial.printf(D_WARN_BUFFERFULL "\n", kCaptureBufferSize);
+        Serial.println(D_STR_LIBRARY "   : v" _IRREMOTEESP8266_VERSION_STR "\n");
+        if (kTolerancePercentage != kTolerance)
+            Serial.printf(D_STR_TOLERANCE " : %d%%\n", kTolerancePercentage);
+        Serial.print(resultToHumanReadableBasic(&results));
+        String description = IRAcUtils::resultAcToString(&results);
+        if (description.length()) {
+            Serial.println(D_STR_MESGDESC ": " + description);
+
+            // Create a custom JSON object to publish IR command details
+            StaticJsonDocument<256> jsonDoc;
+            stdAc::state_t state;
+            IRAcUtils::decodeToState(&results, &state);
+            jsonDoc["protocol"] = typeToString(state.protocol);
+            jsonDoc["model"] = state.model;
+            jsonDoc["power"] = state.power;
+            jsonDoc["temperature"] = state.degrees;
+            jsonDoc["mode"] = IRac::opmodeToString(state.mode);
+            jsonDoc["fan"] = IRac::fanspeedToString(state.fanspeed);
+
+            char jsonBuffer[256];
+            serializeJson(jsonDoc, jsonBuffer);
+            client.publish(mqtt_topic_send, jsonBuffer);
+        }
+        yield();
+#if LEGACY_TIMING_INFO
+        Serial.println(resultToTimingInfo(&results));
+        yield();
+#endif
+        Serial.println(resultToSourceCode(&results));
+        Serial.println();
+        yield();
+    }
+}
