@@ -11,11 +11,12 @@
 #include <ESP8266WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include "env.h"
 
 // WiFi and MQTT configuration
-const char *ssid = "ssid";
-const char *password = "pass";
-const char *mqtt_server = "192.168.15.71";
+const char *ssid = WIFI_SSID;
+const char *password = WIFI_PASSWORD;
+const char *mqtt_server = MQTT_SERVER;
 const char *mqtt_topic_receive = "ac/state";
 const char *mqtt_topic_send = "ac/command";
 
