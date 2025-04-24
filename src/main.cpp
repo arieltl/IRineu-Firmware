@@ -22,6 +22,7 @@ const char *mqtt_topic_send = "ac/command";
 WiFiClient espClient;
 PubSubClient client(espClient);
 
+// === BEGIN CONFIGURATION ===
 const uint16_t kRecvPin = 5; // Use GPIO 5 (D1 on NodeMCU)
 #define kSendPin  4 // Use GPIO 4 (D2 on NodeMCU)
 const uint32_t kBaudRate = 115200; // Serial baud rate
@@ -34,9 +35,8 @@ const uint8_t kTimeout = 15; // Timeout for most remotes
 const uint16_t kMinUnknownSize = 12; // Minimum size for unknown messages
 const uint8_t kTolerancePercentage = kTolerance; // Signal tolerance
 #define LEGACY_TIMING_INFO false
-// === END CONFIGURATION ===
-
 #define REBOOT_BUTTON_PIN 0
+// === END CONFIGURATION ===
 
 IRrecv irrecv(kRecvPin, kCaptureBufferSize, kTimeout, true);
 decode_results results;
