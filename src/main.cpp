@@ -17,8 +17,11 @@
 const char *ssid = WIFI_SSID;
 const char *password = WIFI_PASSWORD;
 const char *mqtt_server = MQTT_SERVER;
-const char *mqtt_topic_receive = "ac/state";
-const char *mqtt_topic_send = "ac/command";
+const char *mqtt_ac_command = "ac/state";
+const char *mqtt_ac_report = "ac/command";
+
+const char *mqtt_raw_command = "raw/state";
+const char *mqtt_raw_report = "raw/command";
 
 WiFiClient espClient;
 PubSubClient client(espClient);
@@ -57,7 +60,8 @@ void connectToMQTT() {
         Serial.print("Connecting to MQTT...");
         if (client.connect("ESP8266Client")) {
             Serial.println("connected");
-            client.subscribe(mqtt_topic_receive);
+            client.subscribe(mqtt_ac_command);
+            client.subscribe(mqtt_raw_command);
         } else {
             Serial.print("failed with state ");
             Serial.println(client.state());
@@ -74,7 +78,7 @@ void callback(char *topic, byte *payload, unsigned int length) {
     Serial.print("Message received: ");
     Serial.println(message);
 
-    if (String(topic) == mqtt_topic_receive) {
+    if (String(topic) == mqtt_ac_command) {
         StaticJsonDocument<256> doc;
         DeserializationError error = deserializeJson(doc, message);
 
@@ -104,6 +108,19 @@ void callback(char *topic, byte *payload, unsigned int length) {
         // Send IR command
         ac.sendAc();
         Serial.println("IR command sent.");
+    }
+    else if (String(topic) == mqtt_raw_command) {
+        uint16_t* data = (uint16_t*) payload;
+        uint16_t len = data[0];
+        
+        if (len == 0) {
+            return;
+        }
+        
+        data++;
+        IRsend irsend(kSendPin);
+        irsend.begin(); // Required before sending
+        irsend.sendRaw(data, len, 38); // 38 kHz typical IR carrier
     }
 }
 
@@ -169,15 +186,31 @@ void loop()
 
             char jsonBuffer[256];
             serializeJson(jsonDoc, jsonBuffer);
-            client.publish(mqtt_topic_send, jsonBuffer);
+            Serial.println(jsonBuffer);
+            Serial.println();
+            client.publish(mqtt_ac_report, jsonBuffer);
+        }
+        else {
+            StaticJsonDocument<512> jsonDoc;
+            JsonArray rawArray = jsonDoc.createNestedArray("rawData");
+
+            for (uint16_t i = 1; i < results.rawlen; i++) {
+                rawArray.add((int)results.rawbuf[i] * kRawTick);
+            }
+            
+            char jsonBuffer[512];
+            serializeJson(jsonDoc, jsonBuffer);
+            Serial.println(jsonBuffer);
+            Serial.println();
+            client.publish(mqtt_raw_report, jsonBuffer);
         }
         yield();
 #if LEGACY_TIMING_INFO
         Serial.println(resultToTimingInfo(&results));
         yield();
 #endif
-        Serial.println(resultToSourceCode(&results));
-        Serial.println();
+        //Serial.println(resultToSourceCode(&results));
+        //Serial.println();
         yield();
     }
 }
