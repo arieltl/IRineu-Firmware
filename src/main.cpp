@@ -11,26 +11,40 @@
 #include <ESP8266WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include <Utils.h>
+
 #include "env.h"
 
 // WiFi and MQTT configuration
 const char *ssid = WIFI_SSID;
 const char *password = WIFI_PASSWORD;
 const char *mqtt_server = MQTT_SERVER;
-const char *mqtt_ac_command = "ac/state";
-const char *mqtt_ac_report = "ac/command";
+const char *mqtt_ac_command = "ac/command";
+const char *mqtt_ac_report = "ac/state";
 
-const char *mqtt_raw_command = "raw/state";
-const char *mqtt_raw_report = "raw/command";
+const char *mqtt_raw_command = "raw/command";
+const char *mqtt_raw_report = "raw/report";
+
+
+#define MAX_ELEMS    400
+#define MAX_STRLEN  (MAX_ELEMS*5 + 8)  // worst-case input length
+char sharedBuf[MAX_STRLEN]; //needed to save memory
+
+// Make these variables accessible from other files
+extern const size_t max_str_len = MAX_STRLEN;
+extern const size_t max_elems = MAX_ELEMS;
 
 WiFiClient espClient;
 PubSubClient client(espClient);
+
+// Increase MQTT buffer size
+const int mqtt_buffer_size = MAX_STRLEN + 100;  // Increased from default 128 bytes
 
 // === BEGIN CONFIGURATION ===
 const uint16_t kRecvPin = 5; // Use GPIO 5 (D1 on NodeMCU)
 #define kSendPin  4 // Use GPIO 4 (D2 on NodeMCU)
 const uint32_t kBaudRate = 115200; // Serial baud rate
-const uint16_t kCaptureBufferSize = 1024; // Buffer for IR data
+const uint16_t kCaptureBufferSize = 1024; // Reduced from 1024 to 512
 #if DECODE_AC
 const uint8_t kTimeout = 50; // Timeout for A/C remotes
 #else
@@ -58,7 +72,7 @@ void connectToWiFi() {
 void connectToMQTT() {
     while (!client.connected()) {
         Serial.print("Connecting to MQTT...");
-        if (client.connect("ESP8266Client")) {
+        if (client.connect("ESP8266Client", "test","test")) {
             Serial.println("connected");
             client.subscribe(mqtt_ac_command);
             client.subscribe(mqtt_raw_command);
@@ -71,16 +85,23 @@ void connectToMQTT() {
 }
 
 void callback(char *topic, byte *payload, unsigned int length) {
-    String message;
-    for (int i = 0; i < length; i++) {
-        message += (char)payload[i];
+    // Check if payload is too long for our buffer
+    if (length >= MAX_STRLEN) {
+        Serial.println("Message too long, ignoring");
+        return;
     }
-    Serial.print("Message received: ");
-    Serial.println(message);
 
-    if (String(topic) == mqtt_ac_command) {
-        StaticJsonDocument<256> doc;
-        DeserializationError error = deserializeJson(doc, message);
+    // Copy payload directly to shared buffer
+    memcpy(sharedBuf, payload, length);
+    sharedBuf[length] = '\0';  // Null terminate
+
+    Serial.print("Message received: ");
+    Serial.println(sharedBuf);
+    irrecv.disableIRIn(); // avoid echo signal
+
+    if (strcmp(topic, mqtt_ac_command) == 0) {
+        StaticJsonDocument<512> doc;
+        DeserializationError error = deserializeJson(doc, sharedBuf);
 
         if (error) {
             Serial.print("Failed to parse JSON: ");
@@ -109,19 +130,22 @@ void callback(char *topic, byte *payload, unsigned int length) {
         ac.sendAc();
         Serial.println("IR command sent.");
     }
-    else if (String(topic) == mqtt_raw_command) {
-        uint16_t* data = (uint16_t*) payload;
-        uint16_t len = data[0];
+    else if (strcmp(topic, mqtt_raw_command) == 0) {
+        size_t outLen;
+        uint16_t* data = parseHexMessage(outLen); // outLen is passed by reference
         
-        if (len == 0) {
+        if (data == nullptr || outLen == 0) {
+            Serial.println("Invalid raw command format");
             return;
         }
         
-        data++;
         IRsend irsend(kSendPin);
         irsend.begin(); // Required before sending
-        irsend.sendRaw(data, len, 38); // 38 kHz typical IR carrier
+        irsend.sendRaw(data, outLen, 38); // 38 kHz typical IR carrier
+        
+        delete[] data;  // Clean up allocated memory
     }
+    irrecv.enableIRIn(); // enable IR receiver
 }
 
 void checkRebootButton() {
@@ -148,6 +172,7 @@ void setup()
 
     connectToWiFi();
     client.setServer(mqtt_server, 1883);
+    client.setBufferSize(mqtt_buffer_size);  // Set the larger buffer size
     client.setCallback(callback);
 }
 
@@ -161,8 +186,6 @@ void loop()
     checkRebootButton();
 
     if (irrecv.decode(&results)) {
-        uint32_t now = millis();
-        Serial.printf(D_STR_TIMESTAMP " : %06u.%03u\n", now / 1000, now % 1000);
         if (results.overflow)
             Serial.printf(D_WARN_BUFFERFULL "\n", kCaptureBufferSize);
         Serial.println(D_STR_LIBRARY "   : v" _IRREMOTEESP8266_VERSION_STR "\n");
@@ -172,9 +195,8 @@ void loop()
         String description = IRAcUtils::resultAcToString(&results);
         if (description.length()) {
             Serial.println(D_STR_MESGDESC ": " + description);
-
-            // Create a custom JSON object to publish IR command details
-            StaticJsonDocument<256> jsonDoc;
+            Serial.println("AC command received");
+            StaticJsonDocument<128> jsonDoc; // Reduced from 256 to 128
             stdAc::state_t state;
             IRAcUtils::decodeToState(&results, &state);
             jsonDoc["protocol"] = typeToString(state.protocol);
@@ -184,26 +206,33 @@ void loop()
             jsonDoc["mode"] = IRac::opmodeToString(state.mode);
             jsonDoc["fan"] = IRac::fanspeedToString(state.fanspeed);
 
-            char jsonBuffer[256];
-            serializeJson(jsonDoc, jsonBuffer);
-            Serial.println(jsonBuffer);
+            serializeJson(jsonDoc, sharedBuf);
+            Serial.println(sharedBuf);
             Serial.println();
-            client.publish(mqtt_ac_report, jsonBuffer);
+            client.publish(mqtt_ac_report, sharedBuf);
         }
         else {
-            StaticJsonDocument<512> jsonDoc;
-            JsonArray rawArray = jsonDoc.createNestedArray("rawData");
-
-            for (uint16_t i = 1; i < results.rawlen; i++) {
-                rawArray.add((int)results.rawbuf[i] * kRawTick);
-            }
+            Serial.println("Non AC command received");
+            uint16_t *raw_array = resultToRawArray(&results);
+            // Find out how many elements are in the array.
+            uint16_t size = getCorrectedRawLength(&results);
+            uint16ArrayToHexString(raw_array, size, sharedBuf, sizeof(sharedBuf));
             
-            char jsonBuffer[512];
-            serializeJson(jsonDoc, jsonBuffer);
-            Serial.println(jsonBuffer);
+            Serial.print("Publishing to topic: ");
+            Serial.println(mqtt_raw_report);
+            Serial.print("MQTT connected: ");
+            Serial.println(client.connected() ? "yes" : "no");
+            
+            bool published = client.publish(mqtt_raw_report, sharedBuf);
+            Serial.print("Publish result: ");
+            Serial.println(published ? "success" : "failed");
+            
+            delete[] raw_array;
+            Serial.print("Size: ");
+            Serial.println(size);
+            Serial.println(sharedBuf);
             Serial.println();
-            client.publish(mqtt_raw_report, jsonBuffer);
-        }
+        } 
         yield();
 #if LEGACY_TIMING_INFO
         Serial.println(resultToTimingInfo(&results));
