@@ -9,6 +9,7 @@
 #include <IRutils.h>
 #include <assert.h>
 #include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <Utils.h>
@@ -19,11 +20,12 @@
 const char *ssid = WIFI_SSID;
 const char *password = WIFI_PASSWORD;
 const char *mqtt_server = MQTT_SERVER;
-const char *mqtt_ac_command = "ac/command";
-const char *mqtt_ac_report = "ac/state";
+const char *pairing_code = PAIRING_CODE;
+const char *mqtt_ac_command = "ac/" PAIRING_CODE "/command";
+const char *mqtt_ac_report = "ac/" PAIRING_CODE "/state";
 
-const char *mqtt_raw_command = "raw/command";
-const char *mqtt_raw_report = "raw/report";
+const char *mqtt_raw_command = "raw/" PAIRING_CODE "/command";
+const char *mqtt_raw_report = "raw/" PAIRING_CODE "/report";
 
 
 #define MAX_ELEMS    400
@@ -36,6 +38,7 @@ extern const size_t max_elems = MAX_ELEMS;
 
 WiFiClient espClient;
 PubSubClient client(espClient);
+ESP8266WebServer server(80);
 
 // Increase MQTT buffer size
 const int mqtt_buffer_size = MAX_STRLEN + 100;  // Increased from default 128 bytes
@@ -67,6 +70,8 @@ void connectToWiFi() {
         Serial.print(".");
     }
     Serial.println("Connected to WiFi");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
 }
 
 void connectToMQTT() {
@@ -148,12 +153,111 @@ void callback(char *topic, byte *payload, unsigned int length) {
     irrecv.enableIRIn(); // enable IR receiver
 }
 
-void checkRebootButton() {
-    pinMode(REBOOT_BUTTON_PIN, INPUT_PULLUP);
-    if (digitalRead(REBOOT_BUTTON_PIN) == LOW) {
-        Serial.println("Reboot button pressed. Rebooting...");
-        ESP.restart();
-    }
+// Interrupt service routine for reboot button
+ICACHE_RAM_ATTR void rebootISR() {
+    Serial.println("Reboot button pressed. Rebooting...");
+    ESP.restart();
+}
+
+void handleRoot() {
+    String html = R"html(
+<!DOCTYPE html>
+<html>
+<head>
+    <title>IR Remote Control</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .container {
+            background: white;
+            padding: 40px;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            text-align: center;
+            max-width: 400px;
+            width: 100%;
+        }
+        h1 {
+            color: #333;
+            margin-bottom: 30px;
+            font-size: 2em;
+        }
+        .pairing-code {
+            background: #f8f9fa;
+            border: 2px solid #e9ecef;
+            border-radius: 10px;
+            padding: 20px;
+            margin: 20px 0;
+            font-size: 2.5em;
+            font-weight: bold;
+            color: #495057;
+            letter-spacing: 3px;
+            font-family: 'Courier New', monospace;
+        }
+        .info {
+            color: #666;
+            font-size: 0.9em;
+            margin-top: 20px;
+            line-height: 1.6;
+        }
+        .status {
+            background: #d4edda;
+            color: #155724;
+            padding: 10px;
+            border-radius: 5px;
+            margin: 15px 0;
+            border: 1px solid #c3e6cb;
+        }
+        .ip-address {
+            font-family: 'Courier New', monospace;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔌 IR Remote Control</h1>
+        <div class="status">
+            ✅ Device Connected
+        </div>
+        <div class="pairing-code">)html";
+    
+    html += pairing_code;
+    
+    html += R"html(</div>
+        <div class="info">
+            <p><strong>Pairing Code</strong></p>
+            <p>Use this code to pair your device with the IR controller.</p>
+            <p>Device IP: <span class="ip-address">)html";
+    
+    html += WiFi.localIP().toString();
+    
+    html += R"html(</span></p>
+            <p>MAC Address: <span class="ip-address">)html";
+    
+    html += WiFi.macAddress();
+    
+    html += R"html(</span></p>
+        </div>
+    </div>
+</body>
+</html>)html";
+    
+    server.send(200, "text/html", html);
+}
+
+void handleNotFound() {
+    server.send(404, "text/plain", "Page not found");
 }
 
 void setup()
@@ -170,7 +274,23 @@ void setup()
     irrecv.setTolerance(kTolerancePercentage);
     irrecv.enableIRIn();
 
+    Serial.println("Example topic: " );
+    Serial.println(mqtt_ac_command);
+
+    // Setup reboot button interrupt
+    pinMode(REBOOT_BUTTON_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(REBOOT_BUTTON_PIN), rebootISR, FALLING);
+    
     connectToWiFi();
+    
+    // Setup web server
+    server.on("/", handleRoot);
+    server.onNotFound(handleNotFound);
+    server.begin();
+    Serial.println("Web server started");
+    Serial.print("Access the pairing page at: http://");
+    Serial.println(WiFi.localIP());
+    
     client.setServer(mqtt_server, 1883);
     client.setBufferSize(mqtt_buffer_size);  // Set the larger buffer size
     client.setCallback(callback);
@@ -178,12 +298,12 @@ void setup()
 
 void loop()
 {
+    server.handleClient(); // Handle web server requests
+    
     if (!client.connected()) {
         connectToMQTT();
     }
     client.loop();
-
-    checkRebootButton();
 
     if (irrecv.decode(&results)) {
         if (results.overflow)
